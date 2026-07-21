@@ -1,36 +1,3 @@
-"""
-ANIQUEN wake-word server
--------------------------
-Runs the full mel-spectrogram + embedding + wake-word pipeline on the
-SERVER instead of the client device. The phone just streams raw audio
-over a WebSocket and receives back a wake probability / detection flag.
-
-Setup on your always-on VM (e.g. Oracle Cloud Free Tier):
-    pip install fastapi uvicorn onnxruntime numpy websockets
-
-Put these three files in the SAME folder as this script:
-    melspectrogram.onnx
-    embedding_model.onnx   (quantized version is fine and faster)
-    hey_Aniquen.onnx       (quantized version is fine and faster)
-
-Run it:
-    uvicorn server:app --host 0.0.0.0 --port 8000
-
-Then from any device, connect a WebSocket to:
-    ws://<your-vm-public-ip>:8000/ws
-(use wss:// with a reverse proxy + TLS cert if you want it secure —
- recommended before exposing this on the public internet long-term)
-
-Protocol (very simple):
-  - Client sends BINARY WebSocket messages containing raw Float32 PCM
-    samples at 16000 Hz, already scaled to int16 range (same convention
-    as the original browser code: sample * 32768).
-  - Server replies with a JSON TEXT message after each chunk it
-    processes:
-        {"prob": 0.734, "detected": true, "rms": 812.3}
-  - Client just watches for "detected": true to flip the UI green.
-"""
-
 import asyncio
 import json
 import numpy as np
@@ -44,8 +11,8 @@ MEL_BINS = 32
 STRIDE = 8
 CONTEXT_EMBEDDINGS = 16
 
-MAX_BUFFER_SAMPLES = 48000
-MIN_BUFFER_SAMPLES = 32000
+MAX_BUFFER_SAMPLES = 24000
+MIN_BUFFER_SAMPLES = 16000
 
 WAKE_THRESHOLD = 0.3
 CYCLE_HISTORY_LEN = 4
@@ -183,7 +150,13 @@ def process_chunk(state: SessionState) -> dict:
     cycle_max_prob = 0.0
     triggered = False
     last_start = len(state.embedding_history) - CONTEXT_EMBEDDINGS
-    check_from = max(0, last_start - len(new_embeddings))
+    # Cap how many positions we check per cycle — checking all ~28 possible
+    # positions every cycle is too expensive for Render's free-tier CPU.
+    # We'll still re-check nearby positions on the next cycle anyway (VAD
+    # keeps us "active" for several cycles), so this trades a bit of
+    # exhaustiveness for actually being able to keep up in real time.
+    MAX_POSITIONS_PER_CYCLE = 6
+    check_from = max(0, last_start - min(len(new_embeddings), MAX_POSITIONS_PER_CYCLE))
     for start in range(check_from, last_start + 1):
         ctx = np.array(state.embedding_history[start:start + CONTEXT_EMBEDDINGS])
         prob = compute_wake_probability(ctx)
@@ -223,7 +196,13 @@ async def websocket_endpoint(websocket: WebSocket):
             chunk = np.frombuffer(message, dtype=np.float32)
             state.push(chunk)
 
-            result = process_chunk(state)
+            # Run the heavy (blocking) ML pipeline in a background thread instead
+            # of directly on the event loop. Without this, a slow inference call
+            # (very likely on Render's free-tier CPU) freezes the ENTIRE websocket
+            # connection — no new audio can be received, no keepalive frames can
+            # be answered — which is what was causing the periodic disconnects
+            # and "bursty" log delivery.
+            result = await asyncio.to_thread(process_chunk, state)
             if result is not None:
                 await websocket.send_text(json.dumps(result))
     except WebSocketDisconnect:
