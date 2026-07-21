@@ -1,3 +1,36 @@
+"""
+ANIQUEN wake-word server
+-------------------------
+Runs the full mel-spectrogram + embedding + wake-word pipeline on the
+SERVER instead of the client device. The phone just streams raw audio
+over a WebSocket and receives back a wake probability / detection flag.
+
+Setup on your always-on VM (e.g. Oracle Cloud Free Tier):
+    pip install fastapi uvicorn onnxruntime numpy websockets
+
+Put these three files in the SAME folder as this script:
+    melspectrogram.onnx
+    embedding_model.onnx   (quantized version is fine and faster)
+    hey_Aniquen.onnx       (quantized version is fine and faster)
+
+Run it:
+    uvicorn server:app --host 0.0.0.0 --port 8000
+
+Then from any device, connect a WebSocket to:
+    ws://<your-vm-public-ip>:8000/ws
+(use wss:// with a reverse proxy + TLS cert if you want it secure —
+ recommended before exposing this on the public internet long-term)
+
+Protocol (very simple):
+  - Client sends BINARY WebSocket messages containing raw Float32 PCM
+    samples at 16000 Hz, already scaled to int16 range (same convention
+    as the original browser code: sample * 32768).
+  - Server replies with a JSON TEXT message after each chunk it
+    processes:
+        {"prob": 0.734, "detected": true, "rms": 812.3}
+  - Client just watches for "detected": true to flip the UI green.
+"""
+
 import asyncio
 import json
 import numpy as np
@@ -11,8 +44,8 @@ MEL_BINS = 32
 STRIDE = 8
 CONTEXT_EMBEDDINGS = 16
 
-MAX_BUFFER_SAMPLES = 24000
-MIN_BUFFER_SAMPLES = 16000
+MAX_BUFFER_SAMPLES = 48000
+MIN_BUFFER_SAMPLES = 32000
 
 WAKE_THRESHOLD = 0.3
 CYCLE_HISTORY_LEN = 4
