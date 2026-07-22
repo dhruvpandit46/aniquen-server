@@ -33,9 +33,12 @@ Protocol (very simple):
 
 import asyncio
 import json
+import os
 import numpy as np
 import onnxruntime as ort
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import httpx
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 
 # ----- configuration (mirrors the browser version) ----------------------
 SAMPLE_RATE = 16000
@@ -216,6 +219,69 @@ def process_chunk(state: SessionState) -> dict:
 
 
 app = FastAPI()
+
+# Allow your GitHub Pages site to call these endpoints from the browser.
+# CORS only affects browser-enforced requests — it's not a full security
+# boundary — but it stops random other websites from silently using your
+# key via a user's browser. Restrict this to your actual site's origin.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://dhruvpandit46.github.io"],
+    allow_methods=["POST"],
+    allow_headers=["*"],
+)
+
+# Keys are read from environment variables set on the VM (systemd service
+# file) — NEVER hardcoded here, NEVER committed to git.
+GROQ_WHISPER_KEY = os.environ.get("GROQ_WHISPER_KEY", "")
+GROQ_LLM_KEY = os.environ.get("GROQ_LLM_KEY", "")
+
+
+@app.post("/api/transcribe")
+async def transcribe(file: UploadFile = File(...)):
+    """Proxies an audio file to Groq Whisper for transcription. The
+    client never sees the Groq API key."""
+    contents = await file.read()
+    files = {"file": (file.filename or "audio.webm", contents, file.content_type or "audio/webm")}
+    data = {
+        "model": "whisper-large-v3-turbo",
+        "response_format": "text",
+        "language": "en",
+    }
+    headers = {"Authorization": f"Bearer {GROQ_WHISPER_KEY}"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers=headers, data=data, files=files
+        )
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "text/plain"),
+    )
+
+
+@app.post("/api/chat")
+async def chat(request: Request):
+    """Proxies a chat-completion request to Groq's LLM. Client sends the
+    same JSON body (model, messages, temperature, max_tokens) it used to
+    send directly to Groq — this just adds the key server-side."""
+    body = await request.json()
+    headers = {
+        "Authorization": f"Bearer {GROQ_LLM_KEY}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers, json=body
+        )
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type="application/json",
+    )
 
 
 @app.websocket("/ws")
